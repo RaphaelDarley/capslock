@@ -1,4 +1,4 @@
 (library
  (name capslock)
  (public_name capslock)
- (libraries capsule await.capsule await.sync await.kernel))
+ (libraries capsule await parallel.scheduler))

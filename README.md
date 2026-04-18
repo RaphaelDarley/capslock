@@ -39,20 +39,22 @@ Capslock assigns each mutex a type-level **level** and threads a linear
 ascending order.
 
 ```ocaml
-module L_a = Capslock.Level.Next (Capslock.Level.Base)  (* level 1 *)
-module L_b = Capslock.Level.Next (L_a)                  (* level 2 *)
+type level_a = Capslock.z Capslock.s               (* level 1 *)
+type level_b = level_a Capslock.s                   (* level 2 *)
 
-let mutex_a : (_, L_a.t) Capslock.Mutex.t = Capslock.Mutex.create key_a
-let mutex_b : (_, L_b.t) Capslock.Mutex.t = Capslock.Mutex.create key_b
+let mutex_a : (_, level_a) Capslock.Mutex.t = Capslock.Mutex.create key_a
+let mutex_b : (_, level_b) Capslock.Mutex.t = Capslock.Mutex.create key_b
 
 (* Correct: A then B -- compiles *)
 Capslock.parallel scheduler ~f:(fun par guard ->
-  let #(result, guard) =
-    Capslock.Mutex.with_lock w mutex_a guard ~f:(fun pw_a guard ->
-      Capslock.Mutex.with_lock w mutex_b guard ~f:(fun pw_b guard ->
-        #(do_work pw_a pw_b, guard)))
+  let #(result, _guard) =
+    Capslock.Mutex.with_access w mutex_a guard ~f:(fun access_a guard ->
+      let #(work, _guard) =
+        Capslock.Mutex.with_access w mutex_b guard ~f:(fun access_b _guard ->
+          do_work access_a access_b)
+      in
+      work)
   in
-  ignore guard;
   result)
 
 (* Wrong: B then A -- TYPE ERROR *)
@@ -60,28 +62,29 @@ Capslock.parallel scheduler ~f:(fun par guard ->
 
 ## Key concepts
 
-**Levels** are type-level Peano naturals (`z`, `z s`, `z s s`, ...). Named
-via functors for cross-module stability:
+**Levels** are type-level Peano naturals (`z`, `z s`, `z s s`, ...). Use type
+aliases to give meaningful names and chain levels:
 
 ```ocaml
-module L_db    = Capslock.Level.Next (Capslock.Level.Base)
-module L_cache = Capslock.Level.Next (L_db)
+type level_db    = Capslock.z Capslock.s
+type level_cache = level_db Capslock.s
 ```
 
-**Guard** (`'n guard`) tracks the floor level. Non-portable (can't leak into
-forked tasks), unique (can't be duplicated), abstract (can't be forged). Only
-obtainable through `Capslock.parallel` or `Capslock.fork_join2`.
+**Guard** (`'n guard`) tracks the floor level. Abstract, unique, and non-portable
+(can't leak into forked tasks). Only obtainable via `Capslock.parallel` or
+`Capslock.fork_join2`.
 
-**`with_lock`** acquires the next level -- no proof needed, types do the work.
+**`with_access`** acquires the next level -- no proof needed, types do the work.
 
-**`with_lock_at`** acquires an arbitrary higher level with an explicit `lt` proof:
+**`with_access_at`** acquires an arbitrary higher level with an explicit `lt` proof:
 
 ```ocaml
-Capslock.Mutex.with_lock_at w mutex guard (Step (Step Base)) ~f:...
+Capslock.Mutex.with_access_at w mutex guard (Step (Step Base)) ~f:...
 ```
 
-**Shadowing**: `open Capslock` shadows `Capsule.Mutex` and `Capsule.With_mutex`
-to prevent accidental use of unordered locks (like `Base` shadows `Stdlib`).
+**No shadowing**: `Capsule.Mutex` stays accessible as an escape hatch.
+`Capslock.Mutex.create` consumes the key, so the two can't protect the same
+capsule.
 
 ## Examples
 
@@ -100,9 +103,8 @@ let increment w =
 let counter = Capslock.With_mutex.create (fun () -> ref 0)
 
 let increment w guard =
-  Capslock.With_mutex.with_lock w counter guard ~f:(fun r guard ->
-    r := !r + 1;
-    #((), guard))
+  Capslock.With_mutex.with_lock w counter guard ~f:(fun r _guard ->
+    r := !r + 1)
 ```
 
 ### Forking
@@ -111,17 +113,22 @@ Each forked task gets its own guard. The parent's guard is non-portable
 so it can't be captured by the children:
 
 ```ocaml
-Capslock.parallel scheduler ~f:(fun par guard ->
+Capslock.parallel scheduler ~f:(fun par _guard ->
   let #(result_a, result_b) =
     Capslock.fork_join2 par
       (fun par guard ->
-        Capslock.Mutex.with_lock w mutex_a guard ~f:(fun pw guard ->
-          #(work_a pw, guard)))
+        let #(work, _guard) =
+          Capslock.Mutex.with_access w mutex_a guard ~f:(fun access _guard ->
+            work_a access)
+        in
+        work)
       (fun par guard ->
-        Capslock.Mutex.with_lock w mutex_a guard ~f:(fun pw guard ->
-          #(work_b pw, guard)))
+        let #(work, _guard) =
+          Capslock.Mutex.with_access w mutex_a guard ~f:(fun access _guard ->
+            work_b access)
+        in
+        work)
   in
-  ignore guard;
   result_a + result_b)
 ```
 
@@ -133,7 +140,7 @@ Capslock.parallel scheduler ~f:(fun par guard ->
 | Lock + data      | `'a With_mutex.t` | `Mutex<T>`                 | `('a, 'n) With_mutex.t`   |
 | Lock level       | --                | `Level<N>`                 | `'n` (Peano type)         |
 | Floor tracker    | --                | `MutexKey<N>`              | `'n guard`                |
-| Level definition | --                | Trait / macro              | `Level.Next` functor      |
+| Level definition | --                | Trait / macro              | Type alias with `s`       |
 | Ordering proof   | --                | Trait bounds               | `('lo, 'hi) lt` GADT      |
 | Same-level group | --                | `LockSet`                  | -- (not yet)              |
 | Key distribution | --                | `Locksmith` / `KeyVoucher` | `parallel` / `fork_join2` |
@@ -148,3 +155,22 @@ Capslock.parallel scheduler ~f:(fun par guard ->
 | `@ portable`  | Can cross domain boundaries           |
 | `@ contended` | May be accessed from multiple domains |
 | `#(a * b)`    | Unboxed tuple (no heap allocation)    |
+
+## TODO
+
+- Add cancellation support
+- Add poisoning variants
+- Add `Password.t` / `Key.t` expert variants (current API uses `Access.t` only)
+- Add a `Sync`-based module (currently only `Await`)
+- Completely replicate the capsule API (all `Capsule.Mutex` and `Capsule.With_mutex` operations)
+- Biased `fork_join2` variant (wraps `Parallel_kernel.Biased.fork_join2`). Left task
+  stays on the caller's domain, so to preserve deadlock-freedom the left closure
+  would inherit the parent's guard via lexical capture rather than receiving a fresh
+  one. Right still forks and gets a fresh guard.
+
+## Notes
+
+Capslock uses `with_access` / `with_access_at` rather than `with_lock`: it mirrors
+`Await.Mutex` and makes the credential type explicit. `Capsule.Mutex.with_lock`
+gives a `Password.t` but `Await_capsule.Mutex.with_lock` gives an `Access.t` — same
+name, different credentials.
